@@ -266,6 +266,9 @@ DOCUMENTATION = '''
         env: [{name: ANSIBLE_SSH_TRANSFER_METHOD}]
         ini:
             - {key: transfer_method, section: ssh_connection}
+        vars:
+            - name: ansible_ssh_transfer_method
+              version_added: '2.12'
       scp_if_ssh:
         default: smart
         description:
@@ -310,6 +313,17 @@ DOCUMENTATION = '''
         cli:
             - name: timeout
         type: integer
+      pkcs11_provider:
+        version_added: '2.12'
+        default: ""
+        description:
+          - "PKCS11 SmartCard provider such as opensc, example: /usr/local/lib/opensc-pkcs11.so"
+          - Requires sshpass version 1.06+, sshpass must support the -P option.
+        env: [{name: ANSIBLE_PKCS11_PROVIDER}]
+        ini:
+          - {key: pkcs11_provider, section: ssh_connection}
+        vars:
+          - name: ansible_ssh_pkcs11_provider
 '''
 
 try:
@@ -389,14 +403,30 @@ class Connection(ConnectionBase):
         return self.connector
 
     def _strip_sudo(self, executable, cmd):
-        # Get the command without sudo
-        sudoless = cmd.rsplit(executable + ' -c ', 1)[1]
-        # Get the quotes
-        quotes = sudoless.partition('echo')[0]
-        # Get the string between the quotes
-        cmd = sudoless[len(quotes):-len(quotes+'?')]
-        # Drop the first command becasue we don't need it
-        cmd = cmd.split('; ', 1)[1]
+        # cmd looks like:
+        #     sudo -H -S -n  -u root /bin/sh -c 'echo BECOME-SUCCESS-hnjapeqklmbeniylaoledvqttgvyefbd ; test -e /usr/local/bin/python || ( pkg install -y python )'
+        # or
+        #     /bin/sh -c 'sudo -H -S -n  -u root /bin/sh -c '"'"'echo BECOME-SUCCESS-xuaumtxycchjfekyxlbykjbqxosupbpd ; /usr/local/bin/python2.7 /root/.ansible/tmp/ansible-tmp-1629053721.2637851-12131-255051228590176/AnsiballZ_pkgng.py'"'"''
+
+        # we need to extract just:
+        #     test -e /usr/local/bin/python || ( pkg install -y python )
+        # or
+        #     /usr/local/bin/python2.7 /root/.ansible/tmp/ansible-tmp-1629053721.2637851-12131-255051228590176/AnsiballZ_pkgng.py
+
+        # to do this, we peel back successive command invocations
+        words = shlex.split(cmd)
+        while words[0] == executable or words[0] == 'sudo':
+            cmd = words[-1]
+            words = shlex.split(cmd)
+
+        # after, cmd is:
+        #    echo BECOME-SUCCESS-hnjapeqklmbeniylaoledvqttgvyefbd ; test -e /usr/local/bin/python || ( pkg install -y python )
+        # or:
+        #    echo BECOME-SUCCESS-xuaumtxycchjfekyxlbykjbqxosupbpd ; /usr/local/bin/python2.7 /root/.ansible/tmp/ansible-tmp-1629053721.2637851-12131-255051228590176/AnsiballZ_pkgng.py
+
+        # drop first command
+        cmd = cmd.split(' ; ', 1)[1]
+
         return cmd
 
     def _strip_sleep(self, cmd):
@@ -442,9 +472,11 @@ class Connection(ConnectionBase):
         return os.path.join(prefix, normpath[1:])
 
     def _copy_file(self, from_file, to_file, executable='/bin/sh'):
-        plugin = self.become
-        shell = get_shell_plugin(executable=executable)
-        copycmd = plugin.build_become_command(' '.join(['cp', from_file, to_file]), shell)
+        copycmd = ' '.join(['cp', from_file, to_file])
+        if self._play_context.become:
+          plugin = self.become
+          shell = get_shell_plugin(executable=executable)
+          copycmd = plugin.build_become_command(copycmd, shell)
 
         display.vvv(u"REMOTE COPY {0} TO {1}".format(from_file, to_file), host=self.inventory_hostname)
         code, stdout, stderr = self._jailhost_command(copycmd)
